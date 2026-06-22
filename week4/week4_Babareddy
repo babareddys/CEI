@@ -1,0 +1,592 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "20c9504f",
+   "metadata": {},
+   "source": [
+    "# CIFAR-10: ANN vs CNN\n",
+    "\n",
+    "Quick comparison of a plain fully-connected network against a few CNN variants\n",
+    "on CIFAR-10. The goal is mostly to see *how much* the architecture matters once\n",
+    "you're working with real images, not just to chase the highest possible number.\n",
+    "\n",
+    "Plan:\n",
+    "1. Load and look at the data\n",
+    "2. Train a basic ANN and a basic CNN, compare them\n",
+    "3. Try a handful of small changes one at a time (deeper ANN, wider CNN, longer\n",
+    "   training, early stopping, augmentation) and see what actually moves the\n",
+    "   needle\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "3f8cb1fa",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import tensorflow as tf\n",
+    "from tensorflow.keras import layers, models\n",
+    "from tensorflow.keras.callbacks import EarlyStopping\n",
+    "import matplotlib.pyplot as plt\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "\n",
+    "print(\"TF:\", tf.__version__)\n",
+    "print(\"GPU:\", tf.config.list_physical_devices('GPU'))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aae604a3",
+   "metadata": {},
+   "source": [
+    "## Data\n",
+    "\n",
+    "CIFAR-10 is 60k tiny 32x32 color images split into 10 classes, 50k for\n",
+    "training and 10k held out for testing. `keras.datasets` ships it already\n",
+    "split, which saves the trouble of dealing with the raw batches."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "850766ac",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "(x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()\n",
+    "\n",
+    "class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',\n",
+    "               'dog', 'frog', 'horse', 'ship', 'truck']\n",
+    "\n",
+    "print(\"train:\", x_train.shape, \"test:\", x_test.shape)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1b87b915",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# sanity check - make sure labels line up with what we expect to see\n",
+    "fig, axes = plt.subplots(2, 5, figsize=(10, 5))\n",
+    "for ax, img, label in zip(axes.flat, x_train, y_train):\n",
+    "    ax.imshow(img)\n",
+    "    ax.set_title(class_names[label[0]])\n",
+    "    ax.axis(\"off\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "ea9187aa",
+   "metadata": {},
+   "source": [
+    "## Preprocessing\n",
+    "\n",
+    "Two things need to happen before any of this goes into a model:\n",
+    "\n",
+    "- scale pixels from 0-255 down to 0-1 (training is a lot more stable this way)\n",
+    "- the ANN can't take a 32x32x3 tensor directly, so it gets a flattened copy\n",
+    "  too. The CNN keeps the original 3D shape since that's the whole point of\n",
+    "  using convolutions in the first place."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "92c971b4",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "x_train_norm = x_train / 255.0\n",
+    "x_test_norm = x_test / 255.0\n",
+    "\n",
+    "x_train_flat = x_train_norm.reshape(len(x_train_norm), -1)\n",
+    "x_test_flat = x_test_norm.reshape(len(x_test_norm), -1)\n",
+    "\n",
+    "print(\"flat:\", x_train_flat.shape, \" image:\", x_train_norm.shape)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "bf10e69b",
+   "metadata": {},
+   "source": [
+    "## Reusable model builders\n",
+    "\n",
+    "Every model below is some variation of \"stack of dense layers\" or \"stack of\n",
+    "conv blocks\", and I kept rewriting the same Sequential boilerplate with one\n",
+    "number changed. Wrapping that in two small functions makes the rest of the\n",
+    "notebook a lot shorter and means a typo in one CNN doesn't have to be fixed in\n",
+    "four different places.\n",
+    "\n",
+    "- `build_ann` takes a list of hidden layer sizes and a matching list of\n",
+    "  dropout rates (use `0` for \"no dropout after this layer\").\n",
+    "- `build_cnn` takes a list of filter counts for the conv blocks. `padding`\n",
+    "  and `bn_on_last` exist because two of the variants below use `'same'`\n",
+    "  padding and batch-norm on the final conv block, while the others don't.\n",
+    "- `fit_model` just wraps `.compile()` + `.fit()` with the settings every run\n",
+    "  in this notebook shares (adam, batch size 64, 10% validation split)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "397d9fcb",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_ann(hidden_sizes, dropout_rates, input_dim=3072, num_classes=10):\n",
+    "    assert len(hidden_sizes) == len(dropout_rates)\n",
+    "    net = models.Sequential()\n",
+    "    net.add(layers.Dense(hidden_sizes[0], activation='relu', input_shape=(input_dim,)))\n",
+    "    if dropout_rates[0] > 0:\n",
+    "        net.add(layers.Dropout(dropout_rates[0]))\n",
+    "    for size, drop in zip(hidden_sizes[1:], dropout_rates[1:]):\n",
+    "        net.add(layers.Dense(size, activation='relu'))\n",
+    "        if drop > 0:\n",
+    "            net.add(layers.Dropout(drop))\n",
+    "    net.add(layers.Dense(num_classes, activation='softmax'))\n",
+    "    return net\n",
+    "\n",
+    "\n",
+    "def build_cnn(filters, padding='valid', bn_on_last=False, dense_units=128,\n",
+    "              dropout=0.4, input_shape=(32, 32, 3), num_classes=10):\n",
+    "    net = models.Sequential()\n",
+    "    for i, f in enumerate(filters):\n",
+    "        is_last = (i == len(filters) - 1)\n",
+    "        if i == 0:\n",
+    "            net.add(layers.Conv2D(f, (3, 3), activation='relu', padding=padding,\n",
+    "                                   input_shape=input_shape))\n",
+    "        else:\n",
+    "            net.add(layers.Conv2D(f, (3, 3), activation='relu', padding=padding))\n",
+    "        if (not is_last) or bn_on_last:\n",
+    "            net.add(layers.BatchNormalization())\n",
+    "        if not is_last:\n",
+    "            net.add(layers.MaxPooling2D((2, 2)))\n",
+    "    net.add(layers.Flatten())\n",
+    "    net.add(layers.Dense(dense_units, activation='relu'))\n",
+    "    net.add(layers.Dropout(dropout))\n",
+    "    net.add(layers.Dense(num_classes, activation='softmax'))\n",
+    "    return net\n",
+    "\n",
+    "\n",
+    "def fit_model(model, x, y, epochs=10, callbacks=None, verbose=1):\n",
+    "    model.compile(optimizer='adam',\n",
+    "                  loss='sparse_categorical_crossentropy',\n",
+    "                  metrics=['accuracy'])\n",
+    "    return model.fit(x, y, epochs=epochs, batch_size=64,\n",
+    "                      validation_split=0.1, callbacks=callbacks, verbose=verbose)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0f071bca",
+   "metadata": {},
+   "source": [
+    "## Baseline ANN\n",
+    "\n",
+    "512 -> 256 -> 10, with dropout after the first layer. This treats every image\n",
+    "as a flat list of 3072 numbers, so it has no idea that nearby pixels are\n",
+    "related - it's just here as a reference point for how much that matters."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "8c6a7006",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ann_model = build_ann([512, 256], [0.3, 0])\n",
+    "ann_model.summary()\n",
+    "\n",
+    "ann_history = fit_model(ann_model, x_train_flat, y_train, epochs=10)\n",
+    "ann_test_loss, ann_test_acc = ann_model.evaluate(x_test_flat, y_test)\n",
+    "print(\"ANN test accuracy:\", ann_test_acc)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d22a72e7",
+   "metadata": {},
+   "source": [
+    "## Baseline CNN\n",
+    "\n",
+    "Three conv blocks (32 -> 64 -> 128 filters), batch-norm + max pooling after\n",
+    "the first two, then a dense head. Same training budget as the ANN (10 epochs,\n",
+    "batch size 64) so the comparison is fair."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "7152904e",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "cnn_model = build_cnn([32, 64, 128])\n",
+    "cnn_model.summary()\n",
+    "\n",
+    "cnn_history = fit_model(cnn_model, x_train_norm, y_train, epochs=10)\n",
+    "cnn_test_loss, cnn_test_acc = cnn_model.evaluate(x_test_norm, y_test)\n",
+    "print(\"CNN test accuracy:\", cnn_test_acc)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "beff8114",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(8, 5))\n",
+    "plt.plot(ann_history.history['val_accuracy'], marker='o', label='ANN')\n",
+    "plt.plot(cnn_history.history['val_accuracy'], marker='s', label='CNN')\n",
+    "plt.xlabel(\"Epoch\")\n",
+    "plt.ylabel(\"Validation accuracy\")\n",
+    "plt.title(\"ANN vs CNN, 10 epochs each\")\n",
+    "plt.legend()\n",
+    "plt.grid(alpha=0.3)\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "31089806",
+   "metadata": {},
+   "source": [
+    "Side-by-side numbers for the two baselines:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "4edf735f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "comparison = pd.DataFrame({\n",
+    "    \"Model\": [\"ANN\", \"CNN\"],\n",
+    "    \"Test Accuracy\": [ann_test_acc, cnn_test_acc],\n",
+    "    \"Test Loss\": [ann_test_loss, cnn_test_loss],\n",
+    "})\n",
+    "comparison\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "ee8cf21a",
+   "metadata": {},
+   "source": [
+    "## Variant 1 - deeper ANN\n",
+    "\n",
+    "Same idea as the baseline ANN but with four hidden layers instead of two\n",
+    "(1024 -> 512 -> 256 -> 128), dropout shrinking as the layers get narrower.\n",
+    "The point here is to see whether just adding depth helps a model that's\n",
+    "still working on flattened pixels with no spatial structure."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "138e14af",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ann_deep_model = build_ann([1024, 512, 256, 128], [0.3, 0.3, 0.2, 0])\n",
+    "ann_deep_model.summary()\n",
+    "\n",
+    "ann_deep_history = fit_model(ann_deep_model, x_train_flat, y_train, epochs=10)\n",
+    "ann_deep_test_loss, ann_deep_test_acc = ann_deep_model.evaluate(x_test_flat, y_test)\n",
+    "print(\"Deep ANN test accuracy:\", ann_deep_test_acc)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "798a27e1",
+   "metadata": {},
+   "source": [
+    "Deepening the ANN tends to give a small bump at best, and it's not even\n",
+    "guaranteed - the model is still blind to where pixels sit relative to each\n",
+    "other, so more layers mostly just means more parameters to overfit with."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1e99e836",
+   "metadata": {},
+   "source": [
+    "## Variant 2 - wider CNN (4 conv blocks)\n",
+    "\n",
+    "Pushing the baseline CNN one block further: 32 -> 64 -> 128 -> 256 filters,\n",
+    "`'same'` padding throughout, and batch-norm on the last block too (the\n",
+    "baseline skips that). Checking whether the extra capacity is worth the extra\n",
+    "compute."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1961ae8c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "cnn_scaled_model = build_cnn([32, 64, 128, 256], padding='same', bn_on_last=True)\n",
+    "cnn_scaled_model.summary()\n",
+    "\n",
+    "cnn_scaled_history = fit_model(cnn_scaled_model, x_train_norm, y_train, epochs=10)\n",
+    "cnn_scaled_test_loss, cnn_scaled_test_acc = cnn_scaled_model.evaluate(x_test_norm, y_test)\n",
+    "print(\"Scaled CNN test accuracy:\", cnn_scaled_test_acc)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "29082123",
+   "metadata": {},
+   "source": [
+    "## Variant 3 - same CNN, double the epochs\n",
+    "\n",
+    "Going back to the original 3-block CNN architecture, just training it for 20\n",
+    "epochs instead of 10 to see whether validation accuracy keeps climbing or\n",
+    "flattens out."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "47b60086",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "cnn_20ep_model = build_cnn([32, 64, 128])\n",
+    "cnn_20ep_history = fit_model(cnn_20ep_model, x_train_norm, y_train, epochs=20)\n",
+    "cnn_20ep_test_loss, cnn_20ep_test_acc = cnn_20ep_model.evaluate(x_test_norm, y_test)\n",
+    "print(\"CNN (20 epochs) test accuracy:\", cnn_20ep_test_acc)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "7ee9036d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(8, 5))\n",
+    "plt.plot(cnn_history.history['val_accuracy'], marker='s', label='10 epochs')\n",
+    "plt.plot(cnn_20ep_history.history['val_accuracy'], marker='^', label='20 epochs')\n",
+    "plt.xlabel(\"Epoch\")\n",
+    "plt.ylabel(\"Validation accuracy\")\n",
+    "plt.title(\"Does training longer keep helping?\")\n",
+    "plt.legend()\n",
+    "plt.grid(alpha=0.3)\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "9dd6b303",
+   "metadata": {},
+   "source": [
+    "## Variant 4 - early stopping\n",
+    "\n",
+    "Same architecture again, up to 20 epochs available, but with `EarlyStopping`\n",
+    "watching validation loss (patience of 3, restores the best weights once it\n",
+    "stops). The idea is to let training cut itself off instead of guessing the\n",
+    "right number of epochs ahead of time."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d28982a2",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "early_stop = EarlyStopping(monitor='val_loss', patience=3,\n",
+    "                           restore_best_weights=True, verbose=1)\n",
+    "\n",
+    "cnn_es_model = build_cnn([32, 64, 128])\n",
+    "cnn_es_history = fit_model(cnn_es_model, x_train_norm, y_train, epochs=20,\n",
+    "                            callbacks=[early_stop])\n",
+    "\n",
+    "print(f\"Stopped after {len(cnn_es_history.history['loss'])} epochs (cap was 20)\")\n",
+    "\n",
+    "cnn_es_test_loss, cnn_es_test_acc = cnn_es_model.evaluate(x_test_norm, y_test)\n",
+    "print(\"CNN + early stopping test accuracy:\", cnn_es_test_acc)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "7f7d0f99",
+   "metadata": {},
+   "source": [
+    "## Variant 5 - data augmentation\n",
+    "\n",
+    "Last change: a smaller 2-block CNN with random flips/rotation/zoom applied\n",
+    "on the fly during training. Augmentation acts like a cheap regularizer -\n",
+    "the model never sees the exact same image twice, so it has a harder time\n",
+    "memorizing the training set. Trained with the same early-stopping setup as\n",
+    "the previous variant so the comparison isn't muddied by epoch count."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "bfcf3078",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "data_augmentation = tf.keras.Sequential([\n",
+    "    layers.RandomFlip(\"horizontal\"),\n",
+    "    layers.RandomRotation(0.1),\n",
+    "    layers.RandomZoom(0.1),\n",
+    "])\n",
+    "\n",
+    "aug_cnn_model = models.Sequential([\n",
+    "    data_augmentation,\n",
+    "    layers.Conv2D(32, 3, activation='relu', input_shape=(32, 32, 3)),\n",
+    "    layers.MaxPooling2D(),\n",
+    "    layers.Conv2D(64, 3, activation='relu'),\n",
+    "    layers.MaxPooling2D(),\n",
+    "    layers.Flatten(),\n",
+    "    layers.Dense(128, activation='relu'),\n",
+    "    layers.Dropout(0.4),\n",
+    "    layers.Dense(10, activation='softmax'),\n",
+    "])\n",
+    "\n",
+    "early_stop_aug = EarlyStopping(monitor='val_loss', patience=3,\n",
+    "                                restore_best_weights=True, verbose=1)\n",
+    "\n",
+    "aug_history = fit_model(aug_cnn_model, x_train_norm, y_train, epochs=20,\n",
+    "                         callbacks=[early_stop_aug])\n",
+    "\n",
+    "aug_test_loss, aug_test_acc = aug_cnn_model.evaluate(x_test_norm, y_test)\n",
+    "print(\"Augmented CNN test accuracy:\", aug_test_acc)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "0ceb4f70",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(8, 5))\n",
+    "plt.plot(cnn_es_history.history['val_accuracy'], marker='s', label='no augmentation')\n",
+    "plt.plot(aug_history.history['val_accuracy'], marker='o', label='with augmentation')\n",
+    "plt.xlabel(\"Epoch\")\n",
+    "plt.ylabel(\"Validation accuracy\")\n",
+    "plt.title(\"Does augmentation actually help here?\")\n",
+    "plt.legend()\n",
+    "plt.grid(alpha=0.3)\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "186ddc16",
+   "metadata": {},
+   "source": [
+    "## All variants, side by side"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "45d2e249",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "final_comparison = pd.DataFrame({\n",
+    "    \"Model\": [\n",
+    "        \"ANN (baseline, 10ep)\",\n",
+    "        \"CNN (baseline, 10ep)\",\n",
+    "        \"ANN (4 layers, 10ep)\",\n",
+    "        \"CNN (4 blocks, 32-256, 10ep)\",\n",
+    "        \"CNN (baseline arch, 20ep)\",\n",
+    "        \"CNN + early stopping (<=20ep)\",\n",
+    "        \"CNN + augmentation + early stopping (<=20ep)\",\n",
+    "    ],\n",
+    "    \"Test Accuracy\": [\n",
+    "        ann_test_acc, cnn_test_acc, ann_deep_test_acc, cnn_scaled_test_acc,\n",
+    "        cnn_20ep_test_acc, cnn_es_test_acc, aug_test_acc,\n",
+    "    ],\n",
+    "    \"Test Loss\": [\n",
+    "        ann_test_loss, cnn_test_loss, ann_deep_test_loss, cnn_scaled_test_loss,\n",
+    "        cnn_20ep_test_loss, cnn_es_test_loss, aug_test_loss,\n",
+    "    ],\n",
+    "}).sort_values(\"Test Accuracy\", ascending=False).reset_index(drop=True)\n",
+    "\n",
+    "final_comparison\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "78047fef",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "plt.figure(figsize=(10, 5))\n",
+    "plt.barh(final_comparison[\"Model\"], final_comparison[\"Test Accuracy\"], color='steelblue')\n",
+    "plt.xlabel(\"Test accuracy\")\n",
+    "plt.title(\"All variants, ranked\")\n",
+    "plt.gca().invert_yaxis()\n",
+    "for i, v in enumerate(final_comparison[\"Test Accuracy\"]):\n",
+    "    plt.text(v + 0.005, i, f\"{v:.3f}\", va='center')\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0199aaa9",
+   "metadata": {},
+   "source": [
+    "## Takeaways\n",
+    "\n",
+    "- The CNN beats the ANN by a wide margin from the very first run, which\n",
+    "  makes sense - convolutions actually exploit the fact that nearby pixels\n",
+    "  are related, while the ANN just sees 3072 unordered numbers.\n",
+    "- Making the ANN deeper barely moves the needle. More parameters doesn't\n",
+    "  fix the underlying problem, which is that it has no concept of spatial\n",
+    "  structure to begin with.\n",
+    "- Adding a fourth, wider conv block gives the CNN a bit more headroom, at\n",
+    "  the cost of a noticeably longer training time - worth it only if that\n",
+    "  last bit of accuracy actually matters for the use case.\n",
+    "- Training the same CNN for twice as long helps some, but the gains get\n",
+    "  smaller each epoch - a sign that it's approaching what this particular\n",
+    "  architecture can do on this data.\n",
+    "- Early stopping doesn't necessarily push accuracy higher, but it avoids\n",
+    "  babysitting the epoch count and protects against wasting time training\n",
+    "  past the point of improvement.\n",
+    "- Augmentation is the one change that meaningfully improves generalization\n",
+    "  on a small, simple CNN - feeding it slightly different images every pass\n",
+    "  makes it harder to just memorize the training set.\n",
+    "\n",
+    "Overall, architecture (ANN vs CNN) matters far more than any of the\n",
+    "individual tweaks tried afterward. Once you're using a CNN, augmentation and\n",
+    "training schedule are the next things worth tuning."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
